@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  DomainName:
+    Description: Domain Name of the website
+    Type: String
+
+  HostedZoneId:
+    Description: Route53 hosted zoneId of the domain
+    Type: String
+
+
+Resources:
+  ElasticContainerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageTagMutability: MUTABLE
+      RepositoryName: fitness-client-repo2
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+#  Attaches internet gateway to the VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+# Creates a Public subnet in the
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet (AZ1)
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Public Subnet (AZ2)
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName} Public Routes
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  AcmCertificates:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+
+
+
+  InGressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Limits the inbound traffic
+      GroupName: EcsSecurityGroup
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+
+  ECSTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 5
+      Protocol: HTTP
+      Port: 80
+      IpAddressType: ipv4
+      ProtocolVersion: HTTP1
+      TargetType: ip
+      VpcId: !Ref VPC
+
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref InGressSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Type: application
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      AliasTarget:
+        HostedZoneId: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+        DNSName: !GetAtt ApplicationLoadBalancer.DNSName
+      Type: A
+
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+#      TODO: NEED to understand in detail
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: [ 'sts:AssumeRole' ]
+            Effect: Allow
+            Principal:
+              Service: [ codebuild.amazonaws.com ]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 'logs:*'
+                - "ecr:BatchCheckLayerAvailability"
+                - "ecr:CompleteLayerUpload"
+                - "ecr:GetAuthorizationToken"
+                - "ecr:InitiateLayerUpload"
+                - "ecr:PutImage"
+                - "ecr:UploadLayerPart"
+                Effect: Allow
+                Resource: '*'
+
+  CodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: FitnessFrontEnd
+      Artifacts:
+        Type: NO_ARTIFACTS
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      BadgeEnabled: true
+      Description: This is a build project for the fitness client
+      Source:
+        Auth:
+          Type: OAUTH
+        GitCloneDepth: 1
+        Location: https://github.com/dhanushthakkalapally/fitness-client
+        Type: GITHUB
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Type: PLAINTEXT
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Type: PLAINTEXT
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Type: PLAINTEXT
+            Value: !Ref ElasticContainerRepo
+          - Name: IMAGE_TAG
+            Type: PLAINTEXT
+            Value: Latest
+        Image: aws/codebuild/standard:6.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PUSH
+            - Type: HEAD_REF
+              Pattern: ^refs/heads/main$
+              ExcludeMatchedPattern: false
+            - Type: COMMIT_MESSAGE
+              Pattern: \[CodeBuild\]
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: MyFargateCluster
+      CapacityProviders:
+        - FARGATE
+#        TODO: NEED TO KNOW WHAT ARE FARGATE DEFAULT PROVIDERS
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+
+  TaskDefinitionIAM:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: [ 'sts:AssumeRole' ]
+            Effect: Allow
+            Principal:
+              Service: [ ecs-tasks.amazonaws.com ]
+        Version: '2012-10-17'
+      Description: Allows ecs to pull the images from the ecr
+      Path: /
+      Policies:
+        - PolicyName: EcsTaskAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:GetDownloadUrlForLayer"
+                  - "ecr:BatchGetImage"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Effect: Allow
+                Resource: '*'
+
+
+  ECSClientTaskDefinition:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        -
+          Name: "fitness-client-image"
+          Image: !Join [":", [!GetAtt ElasticContainerRepo.RepositoryUri, "Latest"]]
+          CPU: 256
+          Memory: 512
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: "/ecs/first-run-task-definition"
+              awslogs-region: "eu-west-2"
+              awslogs-stream-prefix: "ecs"
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+      Cpu: 256
+      Memory: 512
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      RequiresCompatibilities:
+        - "FARGATE"
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref TaskDefinitionIAM
+      TaskRoleArn: !GetAtt TaskDefinitionIAM.Arn
+
+  EcsElbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ECSTargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AcmCertificates
+
+
+  EcsServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: New Security Group to allow only traffic from load balancer
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref InGressSecurityGroup
+      VpcId: !Ref VPC
+
+
+  EcsClientService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSClientTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: 'fitness-client-image'
+          ContainerPort: 80
+          TargetGroupArn: !Ref ECSTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref EcsServiceSecurityGroup
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+
+Outputs:
+  ElasticContainerRepo:
+    Description: Created ECR name is 
+    Value: !Ref ElasticContainerRepo
+  CodeBuild:
+    Description: Here is my first code build using Aws Cloudformation
+    Value: !Ref CodeBuild
+  ECSClientTaskDefinition:
+    Description: Here is the EcsTaskDefinition output
+    Value: !Ref ECSClientTaskDefinition
